@@ -1,0 +1,38 @@
+# ── Credentials & secrets ─────────────────────────────────────────
+hf_credential
+*.token
+.env
+.env.*
+!*.example
+
+# ── Workspace (datasets, model weights) ──────────────────────────
+workspace/
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# ── IDE & editors ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── OS artifacts ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*~
+
+# ── Misc artifacts ────────────────────────────────────────────────
+tmp/
+*.log
+wandb/
+local_*
+
+# ── Symlink (user creates locally: ln -sf common/assets assets) ──
+/assets
+# end of file
