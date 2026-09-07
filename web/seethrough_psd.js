@@ -12,11 +12,19 @@ const { api } = window.comfyAPI.api;
 let agPsdLoaded = false;
 let agPsdLoadPromise = null;
 
+// ComfyUI loads extensions as ES modules, so document.currentScript is null there;
+// import.meta.url is the URL this file was actually served from (works for any folder name).
 const _ownScriptDir = (() => {
+    try {
+        if (typeof import.meta !== "undefined" && import.meta.url) {
+            return new URL("./", import.meta.url).href;
+        }
+    } catch (e) { /* fall through */ }
     const src = document.currentScript?.src;
     if (src) return src.substring(0, src.lastIndexOf("/") + 1);
     return null;
 })();
+console.log("[SeeThrough] extension dir:", _ownScriptDir);
 
 async function ensureAgPsdLoaded() {
     if (agPsdLoaded) return;
@@ -39,6 +47,7 @@ async function ensureAgPsdLoaded() {
         } else {
             const variants = [
                 "ComfyUI-See-through",
+                "comfyUI-See-through",
                 "comfyui-see-through",
                 "ComfyUI-see-through",
             ];
