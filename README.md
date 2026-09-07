@@ -105,6 +105,7 @@ Pre-made workflows are available in the `workflows/` directory:
 | `seethrough-basic.json` | 1280 | 30 | Yes | Standard quality, recommended |
 | `seethrough-layer-editor.json` | 1280 | 30 | Yes | Decompose into the built-in layer editor: parts feed **Create Layered Image** for interactive editing (position, opacity, blend modes) |
 | `seethrough-hair-pieces.json` | 1280 | 30 | Yes | Basic workflow + **Split Layer** cutting `front hair, back hair` into `hair-0 … hair-N` pieces with LaMa fill |
+| `seethrough-8gb-hair-pieces.json` | 1024 | 30 | Yes | NF4 preset for 8 GB cards (e.g. RTX 5060) with the hair **Split Layer** stage |
 | `seethrough-4gb.json` | 512 | 15 | Yes | NF4 preset for 4 GB cards (group_offload must stay off with nf4) |
 | `seethrough-cloud.json` | 1280 | 30 | Yes | bf16 preset for 24 GB+ GPUs |
 

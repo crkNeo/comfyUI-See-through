@@ -105,6 +105,7 @@ ComfyUI/models/SeeThrough/
 | `seethrough-highres.json` | 2048 | 50 | 是 | 高质量 + 保存预览图 |
 | `seethrough-fast.json` | 1024 | 15 | 否 | 快速预览，质量较低 |
 | `seethrough-hair-pieces.json` | 1280 | 30 | 是 | 基础流程 + **Split Layer**：把 `front hair, back hair` 切成 `hair-0 … hair-N` 髮片并用 LaMa 补色 |
+| `seethrough-8gb-hair-pieces.json` | 1024 | 30 | 是 | 8GB 显卡（如 RTX 5060）NF4 预设 + 髮片 **Split Layer** |
 | `seethrough-4gb.json` | 512 | 15 | 是 | 4GB 显卡 NF4 预设（nf4 下 group_offload 必须关闭） |
 | `seethrough-cloud.json` | 1280 | 30 | 是 | 24GB+ 显卡 bf16 预设 |
 
