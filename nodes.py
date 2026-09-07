@@ -21,6 +21,42 @@ def _log_vram(label):
         reserved = torch.cuda.memory_reserved() / (1024 ** 3)
         print(f"[SeeThrough VRAM] {label}: allocated={alloc:.2f}GB, reserved={reserved:.2f}GB", flush=True)
 
+
+def _pick_dtype(use_nf4=False):
+    """bf16 on Ampere+ (sm_80+), fp16 on older cards.
+
+    Turing (sm_75, e.g. GTX 16xx / RTX 20xx) has no native bf16 — torch emulates it,
+    which is correct but slow. fp16 runs on the real tensor cores there instead.
+
+    NF4 is the exception: the published NF4 checkpoints carry
+    bnb_4bit_compute_dtype=bfloat16, so the 4-bit Linear layers dequantize to bf16.
+    Casting the surrounding non-quantized tensors to fp16 mixes dtypes inside
+    attention and crashes with "CUDA error: an illegal memory access was
+    encountered". In NF4 mode the checkpoint wins, whatever the card prefers.
+
+    Override with SEETHROUGH_DTYPE=bf16|fp16|fp32 if a card misbehaves.
+    """
+    override = os.environ.get("SEETHROUGH_DTYPE", "").strip().lower()
+    forced = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+              "fp16": torch.float16, "float16": torch.float16,
+              "fp32": torch.float32, "float32": torch.float32}.get(override)
+    if forced is not None:
+        dtype, why = forced, f"SEETHROUGH_DTYPE={override}"
+    elif use_nf4:
+        dtype, why = torch.bfloat16, "nf4 checkpoint declares bnb_4bit_compute_dtype=bfloat16"
+    elif not torch.cuda.is_available():
+        dtype, why = torch.float32, "no CUDA device"
+    else:
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            dtype, why = torch.bfloat16, f"sm_{major}{minor} has native bf16"
+        else:
+            dtype, why = torch.float16, f"sm_{major}{minor} lacks native bf16, using fp16"
+
+    print(f"[SeeThrough] dtype = {dtype} ({why})", flush=True)
+    return dtype
+
+
 print("[SeeThrough] nodes.py: comfy imports OK", flush=True)
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +109,9 @@ from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize
 from utils.torchcv import cluster_inpaint_part
 
 print("[SeeThrough] All see-through imports OK", flush=True)
+
+from .split_utils import (compute_labels, split_part_by_labels, label_overlay,
+                          unload_lama, SPLIT_MODES)
 
 for _key, _mod in _st_conflict_backup.items():
     if _key not in sys.modules:
@@ -342,7 +381,7 @@ class SeeThrough_LoadLayerDiffModel:
 
     def load_model(self, model, vae_ckpt="", unet_ckpt="", quant_mode="none", cache_tag_embeds=True, group_offload=False, auto_download=True):
         use_nf4 = quant_mode == "nf4"
-        dtype = torch.bfloat16
+        dtype = _pick_dtype(use_nf4)
 
         if use_nf4 and model in _NF4_REPO_MAP:
             model = _NF4_REPO_MAP[model]
@@ -383,7 +422,7 @@ class SeeThrough_LoadLayerDiffModel:
         pipeline.trans_vae.to(dtype=dtype)
 
         if use_nf4:
-            print("[SeeThrough] NF4 mode: casting non-quantized parameters to bf16", flush=True)
+            print(f"[SeeThrough] NF4 mode: casting non-quantized parameters to {dtype}", flush=True)
             _cast_non_quantized_params(pipeline.unet, dtype)
             _cast_non_quantized_params(pipeline.text_encoder, dtype)
             _cast_non_quantized_params(pipeline.text_encoder_2, dtype)
@@ -393,6 +432,19 @@ class SeeThrough_LoadLayerDiffModel:
             pipeline.text_encoder_2.to(dtype=dtype)
 
         pipeline._st_group_offload = False
+        if group_offload and use_nf4:
+            # Group offload moves module blocks on and off the GPU with hooks, but a
+            # bitsandbytes Params4bit carries a quant_state holding device pointers that
+            # the hook's .to() does not migrate. The next kernel then dereferences a stale
+            # pointer and the process dies with "CUDA error: an illegal memory access was
+            # encountered" — an abort, not a catchable OOM. NF4 already cuts VRAM enough
+            # that offloading on top of it buys little, so quantization wins.
+            print("[SeeThrough] WARNING: group_offload is incompatible with quant_mode=nf4 "
+                  "(bitsandbytes quant_state is not migrated by the offload hooks, which "
+                  "crashes with an illegal memory access). Disabling group_offload; "
+                  "NF4 alone is the lower-VRAM option.", flush=True)
+            group_offload = False
+
         if group_offload:
             if hasattr(pipeline, 'enable_group_offload'):
                 print("[SeeThrough] Enabling group offload for LayerDiff pipeline", flush=True)
@@ -444,7 +496,7 @@ class SeeThrough_LoadDepthModel:
 
     def load_model(self, model, quant_mode="none", cache_tag_embeds=True, group_offload=False, auto_download=True):
         use_nf4 = quant_mode == "nf4"
-        dtype = torch.bfloat16
+        dtype = _pick_dtype(use_nf4)
 
         if use_nf4 and model in _NF4_REPO_MAP:
             model = _NF4_REPO_MAP[model]
@@ -460,7 +512,7 @@ class SeeThrough_LoadDepthModel:
         pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, local_files_only=local_only)
 
         if use_nf4:
-            print("[SeeThrough] NF4 mode: casting non-quantized parameters to bf16", flush=True)
+            print(f"[SeeThrough] NF4 mode: casting non-quantized parameters to {dtype}", flush=True)
             pipeline.vae.to(dtype=dtype)
             _cast_non_quantized_params(pipeline.unet, dtype)
             _cast_non_quantized_params(pipeline.text_encoder, dtype)
@@ -468,6 +520,19 @@ class SeeThrough_LoadDepthModel:
             pipeline.to(dtype=dtype)
 
         pipeline._st_group_offload = False
+        if group_offload and use_nf4:
+            # Group offload moves module blocks on and off the GPU with hooks, but a
+            # bitsandbytes Params4bit carries a quant_state holding device pointers that
+            # the hook's .to() does not migrate. The next kernel then dereferences a stale
+            # pointer and the process dies with "CUDA error: an illegal memory access was
+            # encountered" — an abort, not a catchable OOM. NF4 already cuts VRAM enough
+            # that offloading on top of it buys little, so quantization wins.
+            print("[SeeThrough] WARNING: group_offload is incompatible with quant_mode=nf4 "
+                  "(bitsandbytes quant_state is not migrated by the offload hooks, which "
+                  "crashes with an illegal memory access). Disabling group_offload; "
+                  "NF4 alone is the lower-VRAM option.", flush=True)
+            group_offload = False
+
         if group_offload:
             if hasattr(pipeline, 'enable_group_offload'):
                 print("[SeeThrough] Enabling group offload for Marigold pipeline", flush=True)
@@ -781,6 +846,11 @@ class SeeThrough_PostProcess:
                 "use_lama": ("BOOLEAN", {"default": True,
                                          "tooltip": "Use LaMa inpainting for hair splitting (better quality). Falls back to OpenCV if disabled."}),
             },
+            "optional": {
+                "split_hair": ("BOOLEAN", {"default": True,
+                                           "tooltip": "v2 models only: split the single 'hair' layer into hairf/hairb by depth. "
+                                                      "Disable to keep 'hair' whole and cut it with SeeThrough Split Layer instead."}),
+            },
         }
 
     RETURN_TYPES = ("SEETHROUGH_PARTS", "IMAGE")
@@ -788,7 +858,7 @@ class SeeThrough_PostProcess:
     FUNCTION = "process"
     CATEGORY = "SeeThrough"
 
-    def process(self, layers_depth, tblr_split=True, use_lama=True):
+    def process(self, layers_depth, tblr_split=True, use_lama=True, split_hair=True):
         layer_dict = layers_depth.layer_dict
         depth_dict = layers_depth.depth_dict
         fullpage = layers_depth.fullpage
@@ -841,7 +911,7 @@ class SeeThrough_PostProcess:
                 _tag_lr_split(eye_tag, tag2pinfo)
             _tag_lr_split("ears", tag2pinfo)
 
-            if "hair" in tag2pinfo:
+            if split_hair and "hair" in tag2pinfo:
                 part_info = tag2pinfo.pop("hair")
                 try:
                     inpaint_mode = "lama" if use_lama else "cv2"
@@ -1016,6 +1086,218 @@ class SeeThrough_PartsToLayers:
         return (document,)
 
 
+def _paste_canvas(canvas, img, xyxy):
+    """Paste img (HxWxC) into canvas at xyxy, clipping to the canvas."""
+    x1, y1 = int(xyxy[0]), int(xyxy[1])
+    h, w = img.shape[:2]
+    ch, cw = canvas.shape[:2]
+    x2, y2 = min(x1 + w, cw), min(y1 + h, ch)
+    if x2 <= x1 or y2 <= y1:
+        return canvas
+    canvas[y1:y2, x1:x2] = img[:y2 - y1, :x2 - x1]
+    return canvas
+
+
+def _merge_parts(pinfos):
+    """Composite several cropped parts (front = smallest depth_median) into one RGBA + depth."""
+    x1 = min(int(p["xyxy"][0]) for p in pinfos)
+    y1 = min(int(p["xyxy"][1]) for p in pinfos)
+    x2 = max(int(p["xyxy"][2]) for p in pinfos)
+    y2 = max(int(p["xyxy"][3]) for p in pinfos)
+    h, w = y2 - y1, x2 - x1
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    alpha = np.zeros((h, w), dtype=np.float32)
+    depth = np.ones((h, w), dtype=np.float32)
+    # back to front, straight-alpha "over"
+    for p in sorted(pinfos, key=lambda q: q.get("depth_median", 1.0), reverse=True):
+        img = p["img"]
+        ph, pw = img.shape[:2]
+        ox, oy = int(p["xyxy"][0]) - x1, int(p["xyxy"][1]) - y1
+        a = img[..., 3].astype(np.float32) / 255.0
+        c = img[..., :3].astype(np.float32)
+        dst_rgb = rgb[oy:oy + ph, ox:ox + pw]
+        dst_a = alpha[oy:oy + ph, ox:ox + pw]
+        out_a = a + dst_a * (1 - a)
+        num = c * a[..., None] + dst_rgb * (dst_a * (1 - a))[..., None]
+        dst_rgb[...] = np.where(out_a[..., None] > 1e-6, num / np.maximum(out_a, 1e-6)[..., None], dst_rgb)
+        dst_a[...] = out_a
+        pd = p["depth"]
+        pd = pd.astype(np.float32) / 255.0 if pd.dtype == np.uint8 else pd.astype(np.float32)
+        vis = img[..., 3] > 15
+        depth[oy:oy + ph, ox:ox + pw][vis] = pd[vis]
+    img = np.concatenate([np.round(rgb).astype(np.uint8), np.round(alpha * 255).astype(np.uint8)[..., None]], axis=-1)
+    return img, depth, [x1, y1, x2, y2]
+
+
+class SeeThrough_SplitLayer:
+    """Cut one (or several merged) layers into K pieces, front to back, inpainting what
+    each piece hides so the pieces behind it stay complete. Default use: hair pieces."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "tags": ("STRING", {"default": "front hair, back hair",
+                                    "tooltip": "Layer name(s) to split, comma separated. Several names are merged first "
+                                               "(v3 models: 'front hair, back hair'; v2 models: 'hair' with split_hair off)."}),
+                "mode": (SPLIT_MODES, {"default": "lineart_watershed",
+                                       "tooltip": "depth_position: KMeans on x,y,depth. lineart_watershed: same seeds, boundaries snapped to line art. "
+                                                  "depth_kmeans: depth only (original front/back logic). masks: use the 'masks' input."}),
+                "num_pieces": ("INT", {"default": 4, "min": 1, "max": 20,
+                                       "tooltip": "Target number of pieces for the automatic modes (final count may differ after component splitting)."}),
+                "output_prefix": ("STRING", {"default": "hair",
+                                             "tooltip": "Pieces are named <prefix>-0, <prefix>-1, ... front to back."}),
+                "inpaint": (["lama", "cv2"], {"default": "lama",
+                                              "tooltip": "How to fill the area hidden behind each front piece."}),
+            },
+            "optional": {
+                "masks": ("MASK", {"tooltip": "mode=masks: one mask per piece, canvas coordinates (use SeeThrough Layer To Image as the base)."}),
+                "depth_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                                           "tooltip": "How much depth counts vs. position in depth_position / lineart_watershed."}),
+                "min_area_ratio": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.5, "step": 0.005,
+                                             "tooltip": "Pieces smaller than this fraction of the layer are merged into neighbours."}),
+                "split_components": ("BOOLEAN", {"default": True,
+                                                 "tooltip": "Give disconnected regions of one cluster their own piece (e.g. left/right side locks)."}),
+                "max_pieces": ("INT", {"default": 8, "min": 0, "max": 40,
+                                       "tooltip": "Hard cap on the number of output pieces (smallest are merged into neighbours). 0 = no cap."}),
+                "mask_order": (["depth", "input"], {"default": "depth",
+                                                   "tooltip": "mode=masks: order pieces by depth, or keep the input mask order (first = front)."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**32 - 1}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_PARTS", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("parts", "preview", "pieces_preview")
+    FUNCTION = "split"
+    CATEGORY = "SeeThrough"
+
+    def split(self, parts, tags, mode, num_pieces, output_prefix, inpaint, masks=None,
+              depth_weight=1.0, min_area_ratio=0.02, split_components=True, max_pieces=8, mask_order="depth", seed=0):
+        tag2pinfo = dict(parts["tag2pinfo"])
+        frame_size = parts["frame_size"]
+        canvas_h, canvas_w = int(frame_size[0]), int(frame_size[1])
+
+        wanted = [t.strip() for t in tags.split(",") if t.strip()]
+        found = [t for t in wanted if t in tag2pinfo and tag2pinfo[t].get("img") is not None]
+        if not found:
+            print(f"[SeeThrough] SplitLayer: none of {wanted} in parts {sorted(tag2pinfo.keys())}, passing through", flush=True)
+            return (parts, _make_preview(tag2pinfo, canvas_h), torch.zeros((1, canvas_h, canvas_w, 3)))
+
+        if len(found) == 1:
+            src = tag2pinfo[found[0]]
+            img = src["img"].copy()
+            depth = src["depth"]
+            depth = depth.astype(np.float32) / 255.0 if depth.dtype == np.uint8 else depth.astype(np.float32).copy()
+            xyxy = [int(v) for v in src["xyxy"]]
+        else:
+            img, depth, xyxy = _merge_parts([tag2pinfo[t] for t in found])
+        x1, y1, x2, y2 = xyxy
+        mask = img[..., 3] > 10
+        if not np.any(mask):
+            return (parts, _make_preview(tag2pinfo, canvas_h), torch.zeros((1, canvas_h, canvas_w, 3)))
+
+        mask_list = None
+        if mode == "masks":
+            if masks is None:
+                raise ValueError("SeeThrough Split Layer: mode 'masks' needs the masks input")
+            m_np = masks.detach().cpu().numpy()
+            if m_np.ndim == 2:
+                m_np = m_np[None]
+            mask_list = []
+            for m in m_np:
+                if m.shape != (canvas_h, canvas_w):
+                    m = cv2.resize(m.astype(np.float32), (canvas_w, canvas_h), interpolation=cv2.INTER_NEAREST)
+                mask_list.append(m[y1:y2, x1:x2] > 0.5)
+
+        labels, meds = compute_labels(img, depth, mask, mode=mode, k=num_pieces, depth_weight=depth_weight,
+                                      min_area_ratio=min_area_ratio, split_components=split_components,
+                                      masks=mask_list, order=mask_order, seed=seed,
+                                      max_pieces=max_pieces if mode != "masks" else 0)
+        n_labels = len(meds)
+        print(f"[SeeThrough] SplitLayer: {found} -> {n_labels} pieces (mode={mode}, inpaint={inpaint})", flush=True)
+
+        if n_labels <= 1:
+            pieces = [{"img": img, "depth": depth, "depth_median": float(np.median(depth[mask]))}]
+        else:
+            try:
+                pieces = split_part_by_labels(img, depth, labels, inpaint=inpaint)
+            except Exception as e:
+                if inpaint == "lama":
+                    print(f"[SeeThrough] SplitLayer: LaMa failed ({e}), falling back to cv2 inpaint", flush=True)
+                    pieces = split_part_by_labels(img, depth, labels, inpaint="cv2")
+                else:
+                    raise
+            finally:
+                if inpaint == "lama":
+                    unload_lama()
+
+        for t in found:
+            tag2pinfo.pop(t, None)
+        prefix = output_prefix.strip() or found[0]
+        for i, piece in enumerate(pieces):
+            name = f"{prefix}-{i}"
+            piece["xyxy"] = list(xyxy)
+            piece["tag"] = name
+            _compute_depth_median(piece)
+            tag2pinfo[name] = piece
+            print(f"  - {name}: depth_median={piece['depth_median']:.4f}", flush=True)
+
+        # label visualisation on a mid-grey canvas
+        base = np.full((y2 - y1, x2 - x1, 3), 128, dtype=np.float32)
+        a = img[..., 3:4].astype(np.float32) / 255.0
+        base = np.round(img[..., :3].astype(np.float32) * a + base * (1 - a)).astype(np.uint8)
+        overlay = label_overlay(base, labels)
+        canvas = np.full((canvas_h, canvas_w, 3), 128, dtype=np.uint8)
+        canvas = _paste_canvas(canvas, overlay, xyxy)
+        pieces_preview = torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0)
+
+        new_parts = {"tag2pinfo": tag2pinfo, "frame_size": frame_size}
+        return (new_parts, _make_preview(tag2pinfo, canvas_h), pieces_preview)
+
+
+class SeeThrough_LayerToImage:
+    """Render one layer at canvas size as IMAGE + MASK, e.g. to paint or SAM masks for Split Layer."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "tags": ("STRING", {"default": "front hair, back hair",
+                                    "tooltip": "Layer name(s), comma separated; several are composited by depth."}),
+                "background": (["gray", "white", "black"], {"default": "gray"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "layer_names")
+    FUNCTION = "render"
+    CATEGORY = "SeeThrough"
+
+    def render(self, parts, tags, background="gray"):
+        tag2pinfo = parts["tag2pinfo"]
+        canvas_h, canvas_w = [int(v) for v in parts["frame_size"]]
+        names = ", ".join(sorted(tag2pinfo.keys(), key=lambda t: tag2pinfo[t].get("depth_median", 1)))
+        wanted = [t.strip() for t in tags.split(",") if t.strip()]
+        found = [t for t in wanted if t in tag2pinfo and tag2pinfo[t].get("img") is not None]
+        bg = {"gray": 128, "white": 255, "black": 0}[background]
+        rgb = np.full((canvas_h, canvas_w, 3), bg, dtype=np.float32)
+        alpha = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+        if found:
+            img, _, xyxy = _merge_parts([tag2pinfo[t] for t in found])
+            x1, y1 = xyxy[0], xyxy[1]
+            h, w = img.shape[:2]
+            a = img[..., 3].astype(np.float32) / 255.0
+            rgb[y1:y1 + h, x1:x1 + w] = img[..., :3].astype(np.float32) * a[..., None] + rgb[y1:y1 + h, x1:x1 + w] * (1 - a)[..., None]
+            alpha[y1:y1 + h, x1:x1 + w] = a
+        else:
+            print(f"[SeeThrough] LayerToImage: none of {wanted} found in [{names}]", flush=True)
+        image = torch.from_numpy(rgb / 255.0).unsqueeze(0)
+        mask = torch.from_numpy(alpha).unsqueeze(0)
+        return (image, mask, names)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeeThrough_LoadLayerDiffModel": SeeThrough_LoadLayerDiffModel,
     "SeeThrough_LoadDepthModel": SeeThrough_LoadDepthModel,
@@ -1024,6 +1306,8 @@ NODE_CLASS_MAPPINGS = {
     "SeeThrough_PostProcess": SeeThrough_PostProcess,
     "SeeThrough_SavePSD": SeeThrough_SavePSD,
     "SeeThrough_PartsToLayers": SeeThrough_PartsToLayers,
+    "SeeThrough_SplitLayer": SeeThrough_SplitLayer,
+    "SeeThrough_LayerToImage": SeeThrough_LayerToImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1034,4 +1318,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeeThrough_PostProcess": "SeeThrough Post Process",
     "SeeThrough_SavePSD": "SeeThrough Save PSD",
     "SeeThrough_PartsToLayers": "SeeThrough Parts To Layers",
+    "SeeThrough_SplitLayer": "SeeThrough Split Layer",
+    "SeeThrough_LayerToImage": "SeeThrough Layer To Image",
 }

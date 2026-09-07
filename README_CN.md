@@ -25,6 +25,8 @@
 | **SeeThrough Load Depth Model** | 加载 Marigold 深度估计管线 |
 | **SeeThrough Decompose** | 完整管线：LayerDiff + Marigold 深度 + 后处理 |
 | **SeeThrough Save PSD** | 保存图层 PNG + 元数据；通过浏览器按钮下载 PSD |
+| **SeeThrough Split Layer** | 把一个图层（或合并多个，如 `front hair, back hair`）切成 K 片，命名 `<prefix>-0 … <prefix>-N`（由前到后）；每片前方遮住的区域用 LaMa 补色，使每片都是完整图层。分割依据可选：线稿分水岭、深度+位置聚类、仅深度、或自定义 mask |
+| **SeeThrough Layer To Image** | 把一个或多个图层以画布尺寸渲染成 `IMAGE` + `MASK`（可在其上绘制 / SAM 出 mask，再以 `masks` 模式喂给 Split Layer） |
 
 ## 安装
 
@@ -102,6 +104,9 @@ ComfyUI/models/SeeThrough/
 | `seethrough-basic.json` | 1280 | 30 | 是 | 标准质量，推荐使用 |
 | `seethrough-highres.json` | 2048 | 50 | 是 | 高质量 + 保存预览图 |
 | `seethrough-fast.json` | 1024 | 15 | 否 | 快速预览，质量较低 |
+| `seethrough-hair-pieces.json` | 1280 | 30 | 是 | 基础流程 + **Split Layer**：把 `front hair, back hair` 切成 `hair-0 … hair-N` 髮片并用 LaMa 补色 |
+| `seethrough-4gb.json` | 512 | 15 | 是 | 4GB 显卡 NF4 预设（nf4 下 group_offload 必须关闭） |
+| `seethrough-cloud.json` | 1280 | 30 | 是 | 24GB+ 显卡 bf16 预设 |
 
 将 `.json` 文件拖入 ComfyUI 即可加载工作流。
 
@@ -146,6 +151,25 @@ ComfyUI/models/SeeThrough/
 |--------|----------------------------------|---------------|--------|-------------|
 | 1280 | 7.95 GB / 13.69 GB | 2.49 GB | 138 秒 | ~16 GB |
 | 2048 | 7.96 GB / 22.56 GB | 2.59 GB | 382 秒 | ~24 GB |
+
+### 图层再分割（髮片、衣服后方物件）
+
+LayerDiff 只认识固定的 tag（`front hair`、`back hair`、`topwear` …），更细的分片在后处理里用 **SeeThrough Split Layer** 完成。把它接在 **Post Process** 与 **Save PSD** 之间（参考 `workflows/seethrough-hair-pieces.json`）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `tags` | `front hair, back hair` | 要分割的图层名，多个用逗号分隔，会先合并再分割。v2 模型请填 `hair` 并把 Post Process 的 `split_hair` 关掉 |
+| `mode` | `lineart_watershed` | `lineart_watershed`：深度+位置聚类做种子，边界贴合线稿；`depth_position`：对 (x, y, depth) 做 KMeans；`depth_kmeans`：仅深度（原本的前/后逻辑）；`masks`：使用 `masks` 输入，一张 mask 一片 |
+| `num_pieces` | 4 | 自动模式的目标聚类数 |
+| `output_prefix` | `hair` | 输出命名 `hair-0`（最前）… `hair-N`（最后），顺序按深度中位数 |
+| `inpaint` | `lama` | 补色方式（`cv2` 为快速备用） |
+| `depth_weight` | 1.0 | 聚类时深度相对位置的权重 |
+| `min_area_ratio` | 0.02 | 小于图层面积此比例的碎片会并入相邻片 |
+| `split_components` | true | 同一聚类中不相连的区域拆成独立片（左右侧髮） |
+| `max_pieces` | 8 | 输出片数上限，最小的片会并入相邻片；0 = 不限制 |
+| `mask_order` | `depth` | `masks` 模式：按深度排序，或保留输入顺序（第一张 = 最前） |
+
+输出：`parts`（来源图层被分片取代）、`preview`（合成预览）、`pieces_preview`（分片标签图，用来调 `num_pieces` / `max_pieces`）。节点可以串联：先切髮片，再用手绘 mask 把 `topwear` 切成衣服与后方物件。要画 mask，先用 **SeeThrough Layer To Image** 把图层渲染出来，在这张图上绘制（mask editor、SAM 节点等），再以 `masks` 模式喂回。mask 需为画布坐标（图层所在的正方形填充画布）；尺寸不同会自动缩放到画布。
 
 ## 输出图层
 

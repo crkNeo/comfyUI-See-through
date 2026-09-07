@@ -26,6 +26,8 @@ Paper: [arxiv:2602.03749](https://arxiv.org/abs/2602.03749) (Conditionally accep
 | **SeeThrough Decompose** | Full pipeline: LayerDiff + Marigold depth + post-processing |
 | **SeeThrough Save PSD** | Save layers as PNGs + metadata; download PSD via browser button |
 | **SeeThrough Parts To Layers** | Convert decomposed parts into a core `LAYERS` document — connect to ComfyUI's **Create Layered Image** node to edit the stack in the built-in layer editor (position, opacity, blend modes) |
+| **SeeThrough Split Layer** | Cut one layer (or several merged, e.g. `front hair, back hair`) into K pieces named `<prefix>-0 … <prefix>-N` front to back; what each front piece hides is inpainted (LaMa) so every piece is a complete layer. Label sources: line-art watershed, depth+position clustering, depth only, or your own masks |
+| **SeeThrough Layer To Image** | Render one or more layers at canvas size as `IMAGE` + `MASK` (paint or SAM masks on it, then feed them to Split Layer in `masks` mode) |
 
 ## Installation
 
@@ -102,6 +104,9 @@ Pre-made workflows are available in the `workflows/` directory:
 |----------|-----------|-------|-----------|-------------|
 | `seethrough-basic.json` | 1280 | 30 | Yes | Standard quality, recommended |
 | `seethrough-layer-editor.json` | 1280 | 30 | Yes | Decompose into the built-in layer editor: parts feed **Create Layered Image** for interactive editing (position, opacity, blend modes) |
+| `seethrough-hair-pieces.json` | 1280 | 30 | Yes | Basic workflow + **Split Layer** cutting `front hair, back hair` into `hair-0 … hair-N` pieces with LaMa fill |
+| `seethrough-4gb.json` | 512 | 15 | Yes | NF4 preset for 4 GB cards (group_offload must stay off with nf4) |
+| `seethrough-cloud.json` | 1280 | 30 | Yes | bf16 preset for 24 GB+ GPUs |
 
 Drag any `.json` file into ComfyUI to load the workflow.
 
@@ -146,6 +151,32 @@ Drag any `.json` file into ComfyUI to load the workflow.
 |------------|---------------------------------------|---------------|------------|----------|
 | 1280 | 7.95 GB / 13.69 GB | 2.49 GB | 138 s | ~16 GB |
 | 2048 | 7.96 GB / 22.56 GB | 2.59 GB | 382 s | ~24 GB |
+
+### Splitting a layer into pieces (hair pieces, objects behind clothing)
+
+LayerDiff only knows its fixed tag set (`front hair`, `back hair`, `topwear`, …), so finer pieces are
+made in post-processing with **SeeThrough Split Layer**. Connect it between **Post Process** and
+**Save PSD** (see `workflows/seethrough-hair-pieces.json`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tags` | `front hair, back hair` | Layer name(s) to split; several names are merged first. v2 models: use `hair` and set `split_hair=false` on Post Process |
+| `mode` | `lineart_watershed` | `lineart_watershed`: seeds from depth+position clustering, boundaries snapped to drawn lines. `depth_position`: KMeans on (x, y, depth). `depth_kmeans`: depth only (the original front/back logic). `masks`: use the `masks` input, one mask per piece |
+| `num_pieces` | 4 | Target number of clusters for the automatic modes |
+| `output_prefix` | `hair` | Pieces are named `hair-0` (front) … `hair-N` (back); order follows median depth |
+| `inpaint` | `lama` | Fill for the area hidden behind each front piece (`cv2` = fast fallback) |
+| `depth_weight` | 1.0 | Weight of depth vs. position in the clustering |
+| `min_area_ratio` | 0.02 | Pieces smaller than this fraction of the layer are merged into neighbours |
+| `split_components` | true | Disconnected regions of one cluster become separate pieces (left/right side locks) |
+| `max_pieces` | 8 | Hard cap on output pieces; smallest are merged into their neighbours. 0 = no cap |
+| `mask_order` | `depth` | `masks` mode: order pieces by depth, or keep the input order (first mask = front) |
+
+Outputs: `parts` (source layer(s) replaced by the pieces), `preview` (composite), `pieces_preview`
+(label map, use it to tune `num_pieces` / `max_pieces`). The node can be chained: split hair first, then
+split `topwear` into the garment and the object behind it with hand-drawn masks. To draw masks, render
+the layer with **SeeThrough Layer To Image**, paint on that image (mask editor, SAM nodes, …) and feed the
+masks back in `masks` mode. Masks must be in canvas coordinates (the padded square the layers live in);
+masks of a different size are resized to the canvas.
 
 ## Output Layers
 
